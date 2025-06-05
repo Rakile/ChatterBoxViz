@@ -40,6 +40,9 @@ You can adjust parameters such as CFG weight, temperature, exaggeration, chunk s
 ---
 
 ## Prerequisites
+The current version of chatterbox-tts (0.1.1) has a bug that prevents you from using the CPU.
+
+If you want to use CPU, you can replace tts.py with the one from https://github.com/resemble-ai/chatterbox/blob/main/src/chatterbox/tts.py
 
 1. **Operating System**  
    - Linux or Windows (PowerShell or Command Prompt recommended on Windows).  
@@ -47,8 +50,6 @@ You can adjust parameters such as CFG weight, temperature, exaggeration, chunk s
    - Python ≥ 3.10.x.  
 3. **CUDA (optional)**  
    - If you plan to use an NVIDIA GPU, install a compatible NVIDIA driver and CUDA toolkit (e.g., CUDA 12.6).  
-4. **Disk Space**  
-   - At least 1 GB free, to accommodate model downloads, temporary files, and output audio.
 
 ---
 
@@ -201,13 +202,6 @@ You can adjust parameters such as CFG weight, temperature, exaggeration, chunk s
 
 
 ## License
-
-* **ChatterBoxViz** (this project) does *not* include its own LICENSE file. If you plan to redistribute or publish this code, please add a license of your choice.
-* **Chatterbox TTS** is licensed under the **MIT License**. Its full text can be found at:
-
-  ```
-  https://github.com/resemble-ai/chatterbox/blob/main/LICENSE
-  ```
 
   Because MIT is permissive, you may redistribute or modify Chatterbox TTS (or any code derived from it) provided you preserve the original MIT license text.
 
