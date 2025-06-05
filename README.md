@@ -85,20 +85,27 @@ You can adjust parameters such as CFG weight, temperature, exaggeration, chunk s
    *   Select your OS, Package (Pip), Compute Platform (CUDA version if you have an NVIDIA GPU, or CPU).
    *   Copy the generated command and run it in your activated virtual environment.
 <br><br>
-   ### Example for CUDA 12.6: 
+   ### Example for CUDA 12.6:
+
+   * **You might need to uninstall torch and torchaudio before installing CUDA-enabled versions.**
+    
+   ```bash
+   pip uninstall torch torchaudio
+   ```
+
    * **Linux** (bash/zsh):
 
-     ```bash
-     pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
-     ```
+   ```bash
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+   ```
 
    * **Windows** (PowerShell or Command Prompt):
 
-     ```powershell
-     pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu126
-     ```
+   ```powershell
+   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
+   ```
 
-6. **Verify NLTK’s Punkt tokenizer**
+7. **Verify NLTK’s Punkt tokenizer**
    On first run, **ChatterBoxViz** will attempt to download the `punkt` tokenizer automatically. To pre-install it manually:
 
    ```bash
