@@ -1,4 +1,6 @@
 import random
+from typing import Optional, Tuple
+
 import gradio as gr
 import numpy as np
 import torchaudio as ta
@@ -12,6 +14,7 @@ import traceback
 import json
 import shutil
 import sys
+import hashlib
 import contextlib
 import logging
 from pathlib import Path
@@ -84,6 +87,25 @@ def suppress_stdout_stderr():
 tts_model = None
 current_device_loaded = None
 
+
+def calculate_file_hash(filepath: str, hash_algo: str = "md5") -> Optional[str]:
+    """Calculate the hash of a file."""
+    if not filepath or not os.path.exists(filepath):
+        logger.error(f"Cannot calculate hash: File not found at '{filepath}'")
+        return None
+
+    hasher = hashlib.new(hash_algo)
+    try:
+        with open(filepath, 'rb') as f:
+            while True:
+                buf = f.read(65536)  # Read in 64k chunks
+                if not buf:
+                    break
+                hasher.update(buf)
+        return hasher.hexdigest()
+    except Exception as e:
+        logger.error(f"Could not calculate {hash_algo} hash for {filepath}: {e}")
+        return None
 
 def setup_nltk():
     """Setup NLTK with proper error handling"""
@@ -696,7 +718,7 @@ def ensure_model_loaded(device_choice: str):
         raise gr.Error(full_error_message)
 
 
-def simple_progress_test(progress=gr.Progress(track_tqdm=False)):
+"""def simple_progress_test(progress=gr.Progress(track_tqdm=False)):
     print("Simple progress test started...")  # Server-side log
     status_updates = []
     dummy_audio_path = os.path.join("outputs", "dummy_audio.wav")  # Define path for dummy audio
@@ -730,495 +752,817 @@ def simple_progress_test(progress=gr.Progress(track_tqdm=False)):
     yield dummy_audio_path, "\n".join(status_updates)
 
 
-with gr.Blocks() as demo:  # Simplest Blocks setup
-    gr.Markdown("Simple Progress Bar Test")
-    with gr.Row():
-        # Input needed for .click() if inputs are specified, even if not used by fn
-        # dummy_input = gr.Textbox(label="Dummy Input", value="click me")
-        submit_button = gr.Button("Run Simple Test")
-    with gr.Row():
-        audio_output = gr.Audio(label="Test Audio Output")
-        status_output = gr.Textbox(label="Test Status")
-
-    submit_button.click(
-        fn=simple_progress_test,
-        inputs=[],  # No inputs for this test function
-        outputs=[audio_output, status_output],
-        show_progress="full"  # This is the key
-    )
+    with gr.Blocks() as demo:  # Simplest Blocks setup
+        gr.Markdown("Simple Progress Bar Test")
+        with gr.Row():
+            # Input needed for .click() if inputs are specified, even if not used by fn
+            # dummy_input = gr.Textbox(label="Dummy Input", value="click me")
+            submit_button = gr.Button("Run Simple Test")
+        with gr.Row():
+            audio_output = gr.Audio(label="Test Audio Output")
+            status_output = gr.Textbox(label="Test Status")
+    
+        submit_button.click(
+            fn=simple_progress_test,
+            inputs=[],  # No inputs for this test function
+            outputs=[audio_output, status_output],
+            show_progress="full"  # This is the key
+        )"""
 
 # --- Main Processing Function ---
+def _validate_initial_inputs(long_text_input, cfg_weight_input, exaggeration_input, temperature_input,
+                             target_chars_input, max_chars_input, status_messages, progress):
+    """Validates all non-file inputs and updates status."""
+    logger.info("Validating inputs...")
+    status_messages.append("🔄 Validating inputs...")
+    # yield None, "\n".join(status_messages) # Yielding from helper is tricky with main generator
+
+    text_valid, text_msg = validate_text_input(long_text_input)
+    if not text_valid:
+        status_messages.append(f"❌ Text validation failed: {text_msg}")
+        return False
+    status_messages.append(f"✅ {text_msg}")
+
+    params_valid, params_msg = validate_parameters(
+        cfg_weight_input, exaggeration_input, temperature_input,
+        target_chars_input, max_chars_input
+    )
+    if not params_valid:
+        status_messages.append(f"❌ Parameter validation failed: {params_msg}")
+        logger.error(f"Parameter validation failed from UI/initial values: {params_msg}")
+        return False
+    status_messages.append(f"✅ {params_msg}")
+
+    space_ok, space_msg = check_disk_space(required_mb=100)
+    status_messages.append(f"{('✅' if space_ok else '⚠️')} {space_msg}")
+    if not space_ok: logger.warning(f"Disk space warning: {space_msg}")
+
+    progress(0.05)
+    return True
+
+
+def _handle_audio_prompt(audio_prompt_file_path_from_ui: Optional[str], status_messages, progress) -> Tuple[Optional[str], bool]:
+    """
+    Handles audio prompt logic: validation, persistence, using existing.
+    Returns: (path_to_use_for_generation, prompt_successfully_persisted_this_run_flag)
+    """
+    status_messages.append("🔄 Processing audio prompt...")
+    # yield None, "\n".join(status_messages) # Cannot yield directly from here if main fn is generator
+
+    current_prompt_for_gen = None
+    persisted_this_run = False
+
+    if audio_prompt_file_path_from_ui:
+        abs_ui_path = os.path.abspath(audio_prompt_file_path_from_ui)
+        abs_persistent_path = os.path.abspath(PERSISTENT_PROMPT_PATH)
+
+        status_messages.append(f"🔄 Validating UI-provided audio prompt: '{os.path.basename(audio_prompt_file_path_from_ui)}'...")
+        # yield None, "\n".join(status_messages) # yield from main
+        audio_valid, audio_msg = validate_audio_file(audio_prompt_file_path_from_ui)
+
+        if not audio_valid:
+            status_messages.append(f"❌ Invalid audio prompt from UI: {audio_msg}")
+            return None, False  # Signal error
+        status_messages.append(f"✅ UI-provided prompt is valid: {audio_msg}")
+
+        is_ui_path_already_persistent = os.path.exists(PERSISTENT_PROMPT_PATH) and \
+                                        abs_ui_path == abs_persistent_path
+
+        if is_ui_path_already_persistent:
+            status_messages.append(f"ℹ️ Using existing persistent prompt (UI path matches): {PERSISTENT_PROMPT_FILENAME}")
+            current_prompt_for_gen = PERSISTENT_PROMPT_PATH
+            persisted_this_run = True
+        else:
+            should_copy_to_persistent = True
+            if os.path.exists(PERSISTENT_PROMPT_PATH):
+                hash_ui_prompt = calculate_file_hash(audio_prompt_file_path_from_ui)
+                hash_persistent_prompt = calculate_file_hash(PERSISTENT_PROMPT_PATH)
+                if hash_ui_prompt and hash_persistent_prompt and hash_ui_prompt == hash_persistent_prompt:
+                    should_copy_to_persistent = False
+                    current_prompt_for_gen = PERSISTENT_PROMPT_PATH
+                    persisted_this_run = True
+                    status_messages.append(f"ℹ️ UI prompt content matches existing persistent prompt. No copy needed. Using: {PERSISTENT_PROMPT_FILENAME}")
+                else:
+                    status_messages.append(f"ℹ️ UI prompt content differs or first time. Will update persistent prompt.")
+            else:
+                status_messages.append(f"ℹ️ No existing persistent prompt. Will create from UI prompt.")
+
+            if should_copy_to_persistent:
+                status_messages.append(f"💾 Updating/creating persistent prompt from '{os.path.basename(audio_prompt_file_path_from_ui)}'...")
+                # yield None, "\n".join(status_messages) # yield from main
+                try:
+                    ensure_app_data_dir()
+                    shutil.copy(audio_prompt_file_path_from_ui, PERSISTENT_PROMPT_PATH)
+                    current_prompt_for_gen = PERSISTENT_PROMPT_PATH
+                    persisted_this_run = True
+                    status_messages.append(f"✅ Prompt saved/updated as persistent: {PERSISTENT_PROMPT_FILENAME}")
+                except Exception as e_copy:
+                    logger.warning(f"Could not copy UI prompt to persistent storage: {e_copy}. Using UI-provided path for this session.", exc_info=True)
+                    status_messages.append(f"⚠️ Could not save prompt persistently (Error: {str(e_copy)[:50]}...). Using UI-provided path.")
+                    current_prompt_for_gen = audio_prompt_file_path_from_ui  # Fallback
+                    persisted_this_run = False
+    else:  # audio_prompt_file_path_from_ui is None
+        status_messages.append("ℹ️ No audio prompt file selected. Will use default/inbuilt voice.")
+        current_prompt_for_gen = None
+        persisted_this_run = False
+
+    progress(0.25)
+    return current_prompt_for_gen, persisted_this_run
+
+
+def _setup_generation_parameters_and_seed(status_messages, seed_num, cfg_weight_input, exaggeration_input, temperature_input,
+                                          target_chars_input, max_chars_input, current_prompt_path_for_generation, progress):
+    """Sets up generation parameters, seed and logs them."""
+    status_messages.append("🔄 Setting up generation parameters & seed...")
+    # yield None, "\n".join(status_messages) # yield from main
+
+    status_messages.append(f"🎯 Using prompt: {os.path.basename(current_prompt_path_for_generation) if current_prompt_path_for_generation else 'Inbuilt/Default'}")
+    status_messages.append(f"⚙️ Parameters: CFG={cfg_weight_input}, Exag={exaggeration_input}, Temp={temperature_input}")
+    status_messages.append(f"✂️ Chunking: Target={target_chars_input}, Max={max_chars_input}")
+    try:
+        actual_seed = int(seed_num)
+        if actual_seed == 0:
+            actual_seed = int(time.time() * 1000) % (2 ** 32)
+            status_messages.append(f"🌱 Using random seed: {actual_seed}")
+        else:
+            status_messages.append(f"🌱 Using fixed seed: {actual_seed}")
+        set_seed(actual_seed)  # Call global set_seed
+        print(f"CONSOLE: Seed set for generation. User input: {seed_num}, Actual seed used: {actual_seed}")
+    except ValueError as e_val:
+        status_messages.append(f"⚠️ Invalid seed value '{seed_num}'. Using random. Error: {e_val}")
+        actual_seed = int(time.time() * 1000) % (2 ** 32);
+        set_seed(actual_seed)
+        print(f"CONSOLE: Fallback random seed set: {actual_seed}")
+    except Exception as e_seed:
+        status_messages.append(f"⚠️ Error setting seed: {e_seed}. Not reproducible.")
+        logger.warning("Could not set seed", exc_info=True)
+    progress(0.30)
+    return  # Parameters are passed by value, seed is global
+
+
+def _perform_tts_generation_loop_old(long_text_input, target_chars_input, max_chars_input,
+                                 current_prompt_path_for_generation, cfg_weight_input,
+                                 exaggeration_input, temperature_input, status_messages, progress):
+    """Handles text chunking and the core TTS generation loop."""
+    global tts_model  # Needs access to the global tts_model
+    all_wavs = []
+    failed_chunks_count = 0
+
+    status_messages.append("🔄 Chunking text...")
+    # yield None, "\n".join(status_messages) # yield from main
+    try:
+        chunks = intelligent_chunk_text(long_text_input, target_chars_input, max_chars_input)
+        if not chunks:
+            status_messages.append("❌ Error: Text chunking resulted in no processable chunks.")
+            return None, failed_chunks_count  # Indicate error
+        status_messages.append(f"Text divided into {len(chunks)} chunks.")
+        progress(0.32)
+        # yield None, "\n".join(status_messages) # yield from main
+
+        total_chunks = len(chunks)
+        loop_progress_start = 0.32
+        loop_progress_range = 0.58
+
+        for i, chunk_text in enumerate(chunks):
+            current_chunk_progress_val = loop_progress_start + (loop_progress_range * (i / total_chunks))
+            progress(current_chunk_progress_val)
+            chunk_info_log = f"Synthesizing chunk {i + 1}/{total_chunks} (len {len(chunk_text)})..."
+            # For immediate UI update of this specific message, the main function must yield
+            # This helper can append to status_messages, and main function yields the whole list.
+            # Or, the main function can construct this message and yield.
+            # For now, let main function handle yielding of combined status_messages.
+            print(f"CONSOLE: Chunk {i + 1}/{total_chunks} ('{chunk_text[:25].replace(chr(10), ' ')}...')")
+            status_messages.append(chunk_info_log)  # Add to main list
+
+            chunk_generated_successfully = False
+            for attempt in range(1, 3):  # Retry loop
+                try:
+                    with suppress_stdout_stderr():
+                        if current_prompt_path_for_generation is None:  # Inbuilt voice
+                            wav_chunk = tts_model.generate(chunk_text, cfg_weight=cfg_weight_input, exaggeration=exaggeration_input, temperature=temperature_input)
+                        else:  # User prompt
+                            wav_chunk = tts_model.generate(
+                                chunk_text, audio_prompt_path=current_prompt_path_for_generation,
+                                cfg_weight=cfg_weight_input, exaggeration=exaggeration_input, temperature=temperature_input
+                            )
+                    all_wavs.append(wav_chunk)
+                    chunk_generated_successfully = True
+                    status_messages.append(f"✅ Chunk {i + 1}/{total_chunks} synthesized.")
+                    break
+                except Exception as e_chunk:
+                    logger.warning(f"Attempt {attempt} for chunk {i + 1} failed.", exc_info=True if attempt == 2 else False)
+                    if attempt == 2:
+                        error_msg_chunk = f"❌ Error on chunk {i + 1}: {str(e_chunk)[:100]}"
+                        status_messages.append(error_msg_chunk)
+                        status_messages.append(f"⏭️ Skipping chunk {i + 1}. Adding 0.5s silence.")
+                        failed_chunks_count += 1
+                        silence_device = getattr(tts_model, 'device', "cpu")
+                        silence_sr = getattr(tts_model, 'sr', 24000)
+                        all_wavs.append(torch.zeros((1, int(silence_sr * 0.5)), device=silence_device))
+                    else:
+                        time.sleep(0.2)
+            # yield None, "\n".join(status_messages) # Yield from main after each chunk status is appended
+
+        progress(loop_progress_start + loop_progress_range)  # Loop finished (0.90)
+        if not all_wavs or all(w.numel() == 0 for w in all_wavs):
+            status_messages.append("❌ Error: No audio data generated after processing all chunks.")
+            return None, failed_chunks_count
+        if failed_chunks_count > 0:
+            status_messages.append(f"⚠️ Gen completed with {failed_chunks_count}/{total_chunks} failed chunks.")
+        return all_wavs, failed_chunks_count
+
+    except Exception as e_gen_loop:
+        status_messages.append(f"❌ Error during TTS generation loop: {e_gen_loop}")
+        logger.error("TTS generation loop error", exc_info=True)
+        return None, failed_chunks_count  # Or a specific error indicator
+
+
+def _perform_tts_generation_loop(
+        long_text_input: str, target_chars_input: int, max_chars_input: int,
+        current_prompt_path_for_generation: Optional[str], cfg_weight_input: float,
+        exaggeration_input: float, temperature_input: float,
+        status_messages: list,  # Takes the main list of messages
+        progress: gr.Progress
+):
+    """
+    Handles text chunking and TTS generation loop.
+    This is now a GENERATOR that yields the complete, updated status log.
+    It returns its final result: (all_wavs_list, failed_chunks_count)
+    """
+    global tts_model
+
+    # --- Chunking ---
+    status_messages.append("🔄 Chunking text...")
+    yield None, "\n".join(status_messages)  # Yield tuple (audio, status)
+    try:
+        chunks = intelligent_chunk_text(long_text_input, target_chars_input, max_chars_input)
+        if not chunks:
+            status_messages.append("❌ Error: Text chunking resulted in no processable chunks.")
+            yield None, "\n".join(status_messages)
+            return None, 0  # Return error indicator
+
+        status_messages.append(f"Text divided into {len(chunks)} chunks.")
+        progress(0.32, desc="Chunking complete.")
+        yield None, "\n".join(status_messages)
+    except Exception as e_chunk_text:
+        status_messages.append(f"❌ Error during text chunking: {e_chunk_text}")
+        logger.error("Text chunking failed", exc_info=True)
+        yield None, "\n".join(status_messages)
+        return None, 0
+
+    # --- Generation Loop ---
+    all_wavs = []
+    failed_chunks_count = 0
+    total_chunks = len(chunks)
+    loop_progress_start = 0.32
+    loop_progress_range = 0.58
+
+    for i, chunk_text in enumerate(chunks):
+        progress(loop_progress_start + (loop_progress_range * (i / total_chunks)), desc=f"Synthesizing chunk {i + 1}/{total_chunks}")
+
+        # We can add a temporary message for this yield cycle without adding it permanently
+        # to the main log, which keeps the final log cleaner.
+        temp_status_for_yield = status_messages[:] + [f"Synthesizing chunk {i + 1}/{total_chunks} (len {len(chunk_text)})..."]
+        yield None, "\n".join(temp_status_for_yield)
+
+        print(f"CONSOLE: Chunk {i + 1}/{total_chunks} ('{chunk_text[:25].replace(chr(10), ' ')}...')")
+
+        chunk_generated_successfully = False
+        for attempt in range(1, 3):
+            try:
+                with suppress_stdout_stderr():
+                    if current_prompt_path_for_generation is None:
+                        wav_chunk = tts_model.generate(chunk_text, cfg_weight=cfg_weight_input, exaggeration=exaggeration_input, temperature=temperature_input)
+                    else:
+                        wav_chunk = tts_model.generate(
+                            chunk_text, audio_prompt_path=current_prompt_path_for_generation,
+                            cfg_weight=cfg_weight_input, exaggeration=exaggeration_input, temperature=temperature_input
+                        )
+                all_wavs.append(wav_chunk)
+                chunk_generated_successfully = True
+                status_messages.append(f"✅ Chunk {i + 1}/{total_chunks} synthesized.")  # Add permanent success message
+                break
+            except Exception as e_chunk:
+                logger.warning(f"Attempt {attempt} for chunk {i + 1} failed.", exc_info=True if attempt == 2 else False)
+                if attempt == 2:
+                    status_messages.append(f"❌ Error on chunk {i + 1}: {str(e_chunk)[:100]}")
+                    status_messages.append(f"⏭️ Skipping chunk {i + 1}. Adding 0.5s silence.")
+                    failed_chunks_count += 1
+                    silence_device = getattr(tts_model, 'device', "cpu");
+                    silence_sr = getattr(tts_model, 'sr', 24000)
+                    all_wavs.append(torch.zeros((1, int(silence_sr * 0.5)), device=silence_device))
+                else:
+                    time.sleep(0.2)
+
+        # After each chunk is fully processed (succeeded or failed), yield the updated permanent log
+        yield None, "\n".join(status_messages)
+
+    progress(0.90, desc="All chunks processed.")
+
+    # --- Final Checks for this stage ---
+    if not all_wavs or all(w.numel() == 0 for w in all_wavs):
+        status_messages.append("❌ Error: No audio data generated after processing all chunks.")
+        yield None, "\n".join(status_messages)
+        return None, failed_chunks_count
+
+    if failed_chunks_count > 0:
+        status_messages.append(f"⚠️ Gen completed with {failed_chunks_count}/{total_chunks} failed chunks.")
+        yield None, "\n".join(status_messages)
+
+    # Return the final data from this helper generator
+    return all_wavs, failed_chunks_count
+
+
+# --- Main Processing Function (Refactored) ---
 def process_text_to_speech(
-        long_text_input: str, audio_prompt_file_path: str,
+        long_text_input: str, audio_prompt_file_path: Optional[str],  # Can be None
         cfg_weight_input: float, exaggeration_input: float,
         temperature_input: float, target_chars_input: int, max_chars_input: int,
         device_choice: str, seed_num: int,
-        progress: gr.Progress = gr.Progress(track_tqdm=False)  # track_tqdm=False is KEY
+        progress: gr.Progress = gr.Progress(track_tqdm=False)
 ):
     status_messages = []
-    global tts_model
     generated_audio_final_path = None
+    global tts_model  # Allow modification by ensure_model_loaded
 
     try:
-        # Stage 0: App Data Dir & Initial Progress
-        progress(0)  # Explicitly start progress at 0
+        # Stage 0: App Data Dir
+        progress(0, desc="Initializing...")  # Initial progress description
         try:
             ensure_app_data_dir()
-            status_messages.append(f"✅ Application data directory '{APP_DATA_DIR}' is ready.")
-        except Exception as e:
-            status_messages.append(f"❌ Critical Error setting up app data directory: {str(e)}")
+            status_messages.append(f"✅ App data dir ready.")
+        except Exception as e:  # Catch PermissionError or other setup errors
+            status_messages.append(f"❌ Critical Error setting up app data: {str(e)}")
             logger.error("Critical Error setting up app data directory", exc_info=True)
             yield None, "\n".join(status_messages);
             return
-        yield None, "\n".join(status_messages)  # Initial status update
-
-        # Stage 1: Initial Validations (e.g., 0% -> 5%)
-        logger.info("Starting TTS generation process: Validating inputs...")
-        status_messages.append("🔄 Validating inputs...")
-        yield None, "\n".join(status_messages)  # Show "Validating" before heavy work
-        # No progress() here yet, let it be done *after* validations.
-
-        text_valid, text_msg = validate_text_input(long_text_input)
-        if not text_valid:
-            status_messages.append(f"❌ Text validation failed: {text_msg}")
-            yield None, "\n".join(status_messages);
-            return
-        status_messages.append(f"✅ {text_msg}")
-
-        params_valid, params_msg = validate_parameters(
-            cfg_weight_input, exaggeration_input, temperature_input,
-            target_chars_input, max_chars_input
-        )
-        if not params_valid:
-            status_messages.append(f"❌ Parameter validation failed: {params_msg}")
-            logger.error(f"Parameter validation failed from UI/initial values: {params_msg}")
-            yield None, "\n".join(status_messages);
-            return
-        status_messages.append(f"✅ {params_msg}")
-
-        space_ok, space_msg = check_disk_space(required_mb=100)  # Reduced for mock testing
-        status_messages.append(f"{('✅' if space_ok else '⚠️')} {space_msg}")
-        if not space_ok: logger.warning(f"Disk space warning: {space_msg}")
-
-        progress(0.05)  # Validations complete
         yield None, "\n".join(status_messages)
 
-        # Stage 2: Model Loading (e.g., 5% -> 20%)
+        # Stage 1: Initial Validations
+        if not _validate_initial_inputs(long_text_input, cfg_weight_input, exaggeration_input, temperature_input,
+                                        target_chars_input, max_chars_input, status_messages, progress):
+            yield None, "\n".join(status_messages);
+            return  # _validate_initial_inputs appends error
+        yield None, "\n".join(status_messages)
+
+        # Stage 2: Model Loading
+        progress(0.05, desc="Loading model...")  # Update progress description
         status_messages.append(f"🔄 Loading TTS model on {device_choice}...")
-        yield None, "\n".join(status_messages)  # Show "Loading model"
+        yield None, "\n".join(status_messages)
         try:
-            model_load_status = ensure_model_loaded(device_choice)  # NO progress object passed
+            model_load_status = ensure_model_loaded(device_choice)  # No progress obj passed here
             status_messages.append(f"✅ {model_load_status}")
-            if audio_prompt_file_path is None:
-                status_messages.append("✅ Setting up inbuilt voice...")
-                REPO_ID = "ResembleAI/chatterbox"
-                local_path = hf_hub_download(repo_id=REPO_ID, filename="conds.pt")
-                tts_model.conds = tts_model.conds.load(local_path, "cuda")
-        except gr.Error as e_gr:  # Catch gr.Error specifically from ensure_model_loaded
+        except gr.Error as e_gr:
             status_messages.append(f"❌ Model loading failed: {str(e_gr)}")
-            logger.error(f"Model loading gr.Error: {str(e_gr)}", exc_info=False)  # No need for full trace if gr.Error
             yield None, "\n".join(status_messages);
             return
-        except Exception as e:  # Catch any other unexpected error
-            status_messages.append(f"❌ Unexpected model loading error: {str(e)}")
+        except Exception as e_model_load:  # Other unexpected errors
+            status_messages.append(f"❌ Unexpected model loading error: {str(e_model_load)}")
             logger.error("Unexpected model loading error", exc_info=True)
             yield None, "\n".join(status_messages);
             return
-        progress(0.20)  # Model loading complete
+        progress(0.20, desc="Model loaded.")
         yield None, "\n".join(status_messages)
 
-        # Stage 3: Audio Prompt Handling (e.g., 20% -> 25%)
-        status_messages.append("🔄 Processing audio prompt...")
-        yield None, "\n".join(status_messages)
-        current_prompt_path_for_generation = None
-        prompt_successfully_persisted_this_run = False
-
-        ui_provided_prompt_path = audio_prompt_file_path
-
-        if ui_provided_prompt_path:
-            # ALWAYS validate the path Gradio gives you for the current run.
-            status_messages.append(f"🔄 Validating UI-provided audio prompt: '{os.path.basename(ui_provided_prompt_path)}'...")
-            yield None, "\n".join(status_messages)
-            audio_valid, audio_msg = validate_audio_file(ui_provided_prompt_path)
-
-            if not audio_valid:
-                status_messages.append(f"❌ Invalid audio prompt from UI: {audio_msg}")
-                yield None, "\n".join(status_messages);
-                return
-            status_messages.append(f"✅ UI-provided prompt is valid: {audio_msg}")
-
-            # Now, decide if we need to update PERSISTENT_PROMPT_PATH
-            # This happens if:
-            # 1. PERSISTENT_PROMPT_PATH doesn't exist yet.
-            # 2. Or, if PERSISTENT_PROMPT_PATH exists but the ui_provided_prompt_path is different
-            #    (This covers new uploads, AND Gradio re-serving a temp path for an already copied file.
-            #     To avoid redundant copies here, you'd need file content hashing).
-            #    For now, we will copy/overwrite to ensure PERSISTENT_PROMPT_PATH matches the UI's active file.
-
-            # Is the UI path already the persistent path? (Means it was loaded from settings and not changed)
-            is_ui_path_already_persistent = os.path.exists(PERSISTENT_PROMPT_PATH) and \
-                                            os.path.abspath(ui_provided_prompt_path) == os.path.abspath(PERSISTENT_PROMPT_PATH)
-
-            if is_ui_path_already_persistent:
-                status_messages.append(f"ℹ️ Using existing persistent prompt (UI path matches persistent path): {PERSISTENT_PROMPT_FILENAME}")
-                current_prompt_path_for_generation = PERSISTENT_PROMPT_PATH
-                prompt_successfully_persisted_this_run = True  # It's already our definitive persistent prompt
-            else:
-                # UI path is different, or persistent path doesn't exist.
-                # Treat ui_provided_prompt_path as the source of truth for this run and for persistence.
-                status_messages.append(f"💾 UI prompt is different or no persistent prompt exists. Updating/creating persistent prompt from '{os.path.basename(ui_provided_prompt_path)}'...")
-                yield None, "\n".join(status_messages)
-                try:
-                    ensure_app_data_dir()
-                    # This shutil.copy will handle the case where ui_provided_prompt_path is a temp file from Gradio.
-                    # It copies the *content* to your PERSISTENT_PROMPT_PATH.
-                    shutil.copy(ui_provided_prompt_path, PERSISTENT_PROMPT_PATH)
-                    current_prompt_path_for_generation = PERSISTENT_PROMPT_PATH  # Generation uses the canonical persistent path
-                    prompt_successfully_persisted_this_run = True
-                    status_messages.append(f"✅ Prompt saved/updated as persistent: {PERSISTENT_PROMPT_FILENAME}")
-                except Exception as e_copy:
-                    logger.warning(f"Could not copy UI prompt to persistent storage: {e_copy}. Using UI-provided path '{ui_provided_prompt_path}' for this session.", exc_info=True)
-                    status_messages.append(f"⚠️ Could not save prompt persistently (Error: {str(e_copy)[:50]}...). Using UI-provided path for this session.")
-                    current_prompt_path_for_generation = ui_provided_prompt_path  # Fallback to the path Gradio gave us
-                    prompt_successfully_persisted_this_run = False
-
-        else:  # No file provided by user, and no persistent prompt exists
-            status_messages.append("❌ No audio prompt provided and no persistent prompt found. Please upload a WAV prompt.")
+        # Stage 3: Audio Prompt Handling
+        current_prompt_path_for_generation, prompt_successfully_persisted_this_run = _handle_audio_prompt(
+            audio_prompt_file_path, status_messages, progress
+        )
+        if current_prompt_path_for_generation is False:  # _handle_audio_prompt signals error
             yield None, "\n".join(status_messages);
-            #return
-        progress(0.25)  # Audio prompt handling complete
-        yield None, "\n".join(status_messages)
+            return
+        yield None, "\n".join(status_messages)  # Show messages from _handle_audio_prompt
 
-        # Stage 4: Setup Generation Parameters & Seed (e.g., 25% -> 30%)
-        status_messages.append("🔄 Setting up generation parameters & seed...")
-        yield None, "\n".join(status_messages)
-        status_messages.append(f"🎯 Using prompt: {os.path.basename(current_prompt_path_for_generation) if current_prompt_path_for_generation else 'None'}")
-        status_messages.append(f"⚙️ Parameters: CFG={cfg_weight_input}, Exag={exaggeration_input}, Temp={temperature_input}")
-        status_messages.append(f"✂️ Chunking: Target={target_chars_input}, Max={max_chars_input}")
-        try:
-            actual_seed = int(seed_num)
-            if actual_seed == 0:
-                actual_seed = int(time.time() * 1000) % (2 ** 32)
-                status_messages.append(f"🌱 Using random seed: {actual_seed}")
-            else:
-                status_messages.append(f"🌱 Using fixed seed: {actual_seed}")
-            set_seed(actual_seed)
-            print(f"CONSOLE: Seed set for generation. User input: {seed_num}, Actual seed used: {actual_seed}")
-        except ValueError as e_val:  # Invalid seed from user
-            status_messages.append(f"⚠️ Invalid seed value '{seed_num}'. Using random seed. Error: {e_val}")
-            actual_seed = int(time.time() * 1000) % (2 ** 32);
-            set_seed(actual_seed)
-            print(f"CONSOLE: Fallback random seed set: {actual_seed}")
-        except Exception as e_seed:  # Other errors from set_seed
-            status_messages.append(f"⚠️ Error setting seed: {e_seed}. Generation might not be reproducible.")
-            logger.warning("Could not set seed", exc_info=True)
-        progress(0.30)  # Setup complete
-        yield None, "\n".join(status_messages)
-
-        # Stage 5: Main Generation Loop (e.g., 30% -> 90%)
-        status_messages.append("🔄 Chunking text...")
-        yield None, "\n".join(status_messages)
-        try:
-            chunks = intelligent_chunk_text(long_text_input, target_chars_input, max_chars_input)
-            if not chunks:
-                status_messages.append("❌ Error: Text chunking resulted in no processable chunks. Try adjusting text or chunking parameters.")
-                yield None, "\n".join(status_messages);
-                return
-            status_messages.append(f"Text divided into {len(chunks)} chunks.")
-            progress(0.32)  # Chunking text done, main loop starts soon
+        # Handle inbuilt voice if no prompt path was resolved and model is loaded
+        if current_prompt_path_for_generation is None and tts_model:
+            status_messages.append("✅ Setting up inbuilt voice conditioning...")
             yield None, "\n".join(status_messages)
-
-            all_wavs = []
-            total_chunks = len(chunks)
-            failed_chunks_count = 0
-            # generation_start_time = time.time() # For timing the loop itself
-
-            # Loop for chunks: 32% to 90%
-            loop_progress_start = 0.32
-            loop_progress_range = 0.58  # This range (90 - 32 = 58) will be distributed among chunks
-
-            for i, chunk_text in enumerate(chunks):
-                # Progress at the START of processing this chunk
-                current_chunk_progress_val = loop_progress_start + (loop_progress_range * (i / total_chunks))
-                progress(current_chunk_progress_val)
-
-                chunk_info_log = f"Synthesizing chunk {i + 1}/{total_chunks} (length {len(chunk_text)} chars)..."
-                # Yield with current progress and status message for this chunk
-                # Add to a temporary list for this yield only to avoid cluttering permanent log prematurely
-                temp_status_for_yield = status_messages[:] + [chunk_info_log]
-                yield None, "\n".join(temp_status_for_yield)
-                print(f"CONSOLE: Chunk {i+1}/{total_chunks} ('{chunk_text[:25].replace(chr(10),' ')}...')")
-
-                chunk_generated_successfully = False
-                for attempt in range(1, 3):  # Try up to 2 times
-                    try:
-                        with suppress_stdout_stderr():  # Suppress verbose model output
-                            if current_prompt_path_for_generation is None:
-                                logger.info("CONSOLE: Using built in voice")
-                                wav_chunk = tts_model.generate(chunk_text, cfg_weight=cfg_weight_input, exaggeration=exaggeration_input, temperature=temperature_input)
-                            else:
-                                wav_chunk = tts_model.generate(
-                                    chunk_text,
-                                    audio_prompt_path=current_prompt_path_for_generation,
-                                    cfg_weight=cfg_weight_input,
-                                    exaggeration=exaggeration_input,
-                                    temperature=temperature_input
-                                )
-                        all_wavs.append(wav_chunk)
-                        chunk_generated_successfully = True
-                        break  # Success, exit retry loop
-                    except Exception as e_chunk:
-                        logger.warning(f"Attempt {attempt} for chunk {i + 1} failed.", exc_info=True if attempt == 2 else False)
-                        if attempt == 2:  # Final attempt failed
-                            error_msg_chunk = f"❌ Error on chunk {i + 1} ('{chunk_text[:20].strip()}...'): {str(e_chunk)[:100]}"
-                            # print(f"CONSOLE: {error_msg_chunk}\n{traceback.format_exc()}") # Console log done by logger.warning
-                            status_messages.append(error_msg_chunk)  # Add to permanent log for UI
-                            status_messages.append(f"⏭️ Skipping chunk {i + 1}. Adding 0.5s silence.")
-                            failed_chunks_count += 1
-                            try:
-                                # Use model's actual device and sr if available, else cpu/default
-                                silence_device = getattr(tts_model, 'device', "cpu")
-                                silence_sr = getattr(tts_model, 'sr', 24000)
-                                silence_tensor = torch.zeros((1, int(silence_sr * 0.5)), device=silence_device)
-                                all_wavs.append(silence_tensor)
-                            except Exception as silence_err:
-                                logger.error(f"Could not create silence tensor for failed chunk: {silence_err}")
-                                all_wavs.append(torch.zeros((1, int(24000 * 0.5))))  # Fallback to CPU tensor
-                        else:  # Not the final attempt, wait a bit
-                            time.sleep(0.2)  # Shorter sleep for retry
-
-                # After processing the chunk (either success or added silence for failure)
-                if chunk_generated_successfully:
-                    status_messages.append(f"✅ Chunk {i + 1}/{total_chunks} synthesized.")
-                # If failed, error messages were already added to status_messages by the loop.
-                # Yield the updated permanent status_messages. Progress for *end* of this chunk is handled
-                # by the next iteration's `current_chunk_progress_val` or after the loop.
-                # yield None, "\n".join(status_messages) # Optional: yield after each chunk's status update
-
-            progress(loop_progress_start + loop_progress_range)  # Loop finished, should be 0.32 + 0.58 = 0.90
-            yield None, "\n".join(status_messages)  # Update status after loop finishes
-
-            if not all_wavs or all(w.numel() == 0 for w in all_wavs):
-                status_messages.append("❌ Error: No audio data generated after processing all chunks.")
-                yield None, "\n".join(status_messages);
-                return
-
-            if failed_chunks_count > 0:
-                status_messages.append(f"⚠️ Generation completed with {failed_chunks_count}/{total_chunks} chunks failed (replaced with silence).")
-
-            status_messages.append("🔊 Merging audio chunks...")
-            yield None, "\n".join(status_messages)
-
-            # Merging (e.g., 90% -> 95%)
             try:
-                # Ensure all tensors are on the same device before cat, prefer model's device
-                merge_device = getattr(tts_model, 'device', 'cpu')
-                processed_wavs = []
-                for idx, wav in enumerate(all_wavs):
-                    if wav.device.type != merge_device:  # Check device type (e.g. 'cuda' vs 'cpu')
-                        logger.info(f"Waveform {idx} on device {wav.device}, moving to {merge_device} for concatenation.")
-                        processed_wavs.append(wav.to(merge_device))
-                    else:
-                        processed_wavs.append(wav)
-                merged_wav = torch.cat(processed_wavs, dim=1)
-            except RuntimeError as e_merge:
-                if "out of memory" in str(e_merge).lower():
-                    status_messages.append("⚠️ GPU/CPU memory full during merge. Trying CPU merge for all chunks...")
-                    yield None, "\n".join(status_messages)
-                    logger.warning("OOM during merge. Attempting full CPU merge.", exc_info=True)
-                    try:
-                        cpu_wavs = [wav.cpu() for wav in all_wavs]  # Move all to CPU first
-                        merged_wav = torch.cat(cpu_wavs, dim=1)
-                        status_messages.append("✅ Merged on CPU successfully after initial failure.")
-                    except Exception as e_cpu_merge:
-                        status_messages.append(f"❌ CPU merge also failed: {e_cpu_merge}")
-                        logger.error("CPU merge failed", exc_info=True)
-                        yield None, "\n".join(status_messages);
-                        return
-                else:  # Other runtime error during merge
-                    status_messages.append(f"❌ Error merging audio chunks: {e_merge}")
-                    logger.error("Merge error", exc_info=True)
-                    yield None, "\n".join(status_messages);
-                    return
-            progress(0.95)  # Merging complete
+                REPO_ID = "ResembleAI/chatterbox";
+                conds_filename = "conds.pt"
+                with suppress_stdout_stderr():
+                    local_path_conds = hf_hub_download(repo_id=REPO_ID, filename=conds_filename)
+                load_device = current_device_loaded if current_device_loaded else device_choice
+                if hasattr(tts_model, 'conds') and hasattr(tts_model.conds, 'load'):
+                    with suppress_stdout_stderr():
+                        tts_model.conds = tts_model.conds.load(local_path_conds, load_device)
+                    status_messages.append(f"✅ Inbuilt voice conditioning loaded for '{load_device}'.")
+                else:
+                    status_messages.append(f"⚠️ Model has no 'conds.load' for inbuilt voice.")
+            except Exception as e_inbuilt:
+                status_messages.append(f"❌ Error setting up inbuilt voice: {str(e_inbuilt)[:100]}...")
+                logger.error("Error setting up inbuilt voice", exc_info=True)
             yield None, "\n".join(status_messages)
 
-            # Saving (e.g., 95% -> 99%)
-            status_messages.append("🔄 Saving audio...")
-            yield None, "\n".join(status_messages)
-            if merged_wav.numel() > 0:
-                ensure_app_data_dir()  # Ensure output directory exists
-                output_dir = os.path.join(APP_DATA_DIR, "outputs")  # Save outputs in app_data/outputs
-                os.makedirs(output_dir, exist_ok=True)
+        # Stage 4: Setup Generation Parameters & Seed
+        _setup_generation_parameters_and_seed(status_messages, seed_num, cfg_weight_input, exaggeration_input, temperature_input,
+                                              target_chars_input, max_chars_input, current_prompt_path_for_generation, progress)
+        yield None, "\n".join(status_messages)  # Show messages from _setup_generation_parameters_and_seed
 
-                timestamp = int(time.time())
-                output_filename = f"chatterbox_output_{timestamp}.wav"
-                output_filepath = os.path.join(output_dir, output_filename)
-                # Fallback to script directory if APP_DATA_DIR is problematic for some reason
-                backup_output_filepath = os.path.join(os.getcwd(), f"chatterbox_output_backup_{timestamp}.wav")
+        # Stage 5: Main Generation Loop
+        progress(0.30, desc="Starting TTS Synthesis...")
+        """all_wavs, failed_chunks_count = _perform_tts_generation_loop(
+            long_text_input, target_chars_input, max_chars_input, current_prompt_path_for_generation,
+            cfg_weight_input, exaggeration_input, temperature_input, status_messages, progress
+        )"""
+        all_wavs, failed_chunks_count = yield from _perform_tts_generation_loop(
+            long_text_input, target_chars_input, max_chars_input,
+            current_prompt_path_for_generation, cfg_weight_input,
+            exaggeration_input, temperature_input,
+            status_messages,  # Pass the list to be appended to
+            progress
+        )
+        if all_wavs is None:
+            # Error occurred in the loop, status is already updated by the last yield.
+            return  # End the main generator
 
+        # _perform_tts_generation_loop appends its own status messages.
+        # We yield after each chunk inside the main loop now.
+
+        # Loop for chunks (inside _perform_tts_generation_loop)
+        # For now, let's assume _perform_tts_generation_loop handles its internal progress updates and status messages
+        # The main function will just yield the accumulated status_messages from it.
+
+        # Simulate the loop by yielding status from the helper
+        # In a real scenario, _perform_tts_generation_loop would be a generator itself or update status_messages directly
+        # For this refactor, we'll make _perform_tts_generation_loop append to status_messages and update progress.
+        # The main function will yield the status_messages list.
+
+        # Corrected flow: _perform_tts_generation_loop does the work and updates status_messages.
+        # The main loop needs to yield these messages.
+        # Let's adjust _perform_tts_generation_loop to be a generator or call yield here.
+        # For simplicity now, assume _perform_tts_generation_loop has updated status_messages.
+        # We'll refine this if _perform_tts_generation_loop needs to yield.
+
+        # This part is tricky without making _perform_tts_generation_loop a generator itself that yields status.
+        # For now, let's assume status_messages are updated by it and we yield periodically.
+        # A better refactor would make helper functions generators too if they have long sub-steps.
+
+        # Let's simplify: The main generation loop within process_text_to_speech
+        # (The following is moved from the original _perform_tts_generation_loop for direct yield)
+
+        """status_messages.append("🔄 Chunking text for generation...")
+        yield None, "\n".join(status_messages)
+        chunks = intelligent_chunk_text(long_text_input, target_chars_input, max_chars_input)
+        if not chunks:
+            status_messages.append("❌ Error: Text chunking resulted in no processable chunks.")
+            yield None, "\n".join(status_messages);
+            return
+        status_messages.append(f"Text divided into {len(chunks)} chunks.")
+        progress(0.32, desc="Chunking complete.")
+        yield None, "\n".join(status_messages)
+
+        all_wavs_gen = []  # Renamed to avoid conflict with potential return from helper
+        total_chunks_gen = len(chunks)
+        failed_chunks_count_gen = 0
+        loop_progress_start = 0.32
+        loop_progress_range = 0.58
+
+        for i, chunk_text in enumerate(chunks):
+            current_chunk_progress_val = loop_progress_start + (loop_progress_range * (i / total_chunks_gen))
+            progress(current_chunk_progress_val, desc=f"Synthesizing chunk {i + 1}/{total_chunks_gen}")
+
+            chunk_info_log = f"Synthesizing chunk {i + 1}/{total_chunks_gen} (len {len(chunk_text)} chars)..."
+            # We need to yield the *current full log*
+            # Create a temporary list for this yield including the new chunk_info_log
+            current_yield_messages = status_messages[:] + [chunk_info_log]
+            yield None, "\n".join(current_yield_messages)
+            print(f"CONSOLE: Chunk {i + 1}/{total_chunks_gen} ('{chunk_text[:25].replace(chr(10), ' ')}...')")
+
+            # Actual generation
+            chunk_generated_successfully = False
+            # Retry loop (kept from your original)
+            for attempt in range(1, 3):
                 try:
-                    sample_rate = getattr(tts_model, 'sr', 24000)  # Use model's sample rate or a common default
-                    ta.save(output_filepath, merged_wav.cpu(), sample_rate)
+                    with suppress_stdout_stderr():
+                        if current_prompt_path_for_generation is None:
+                            wav_chunk = tts_model.generate(chunk_text, cfg_weight=cfg_weight_input, exaggeration=exaggeration_input, temperature=temperature_input)
+                        else:
+                            wav_chunk = tts_model.generate(
+                                chunk_text, audio_prompt_path=current_prompt_path_for_generation,
+                                cfg_weight=cfg_weight_input, exaggeration=exaggeration_input, temperature=temperature_input
+                            )
+                    all_wavs_gen.append(wav_chunk)
+                    chunk_generated_successfully = True
+                    status_messages.append(f"✅ Chunk {i + 1}/{total_chunks_gen} synthesized.")  # Add to permanent log
+                    break
+                except Exception as e_chunk:
+                    logger.warning(f"Attempt {attempt} for chunk {i + 1} failed.", exc_info=True if attempt == 2 else False)
+                    if attempt == 2:
+                        error_msg_chunk = f"❌ Error on chunk {i + 1}: {str(e_chunk)[:100]}"
+                        status_messages.append(error_msg_chunk)  # Add to permanent log
+                        status_messages.append(f"⏭️ Skipping chunk {i + 1}. Adding 0.5s silence.")
+                        failed_chunks_count_gen += 1
+                        silence_device = getattr(tts_model, 'device', "cpu");
+                        silence_sr = getattr(tts_model, 'sr', 24000)
+                        all_wavs_gen.append(torch.zeros((1, int(silence_sr * 0.5)), device=silence_device))
+                    else:
+                        time.sleep(0.2)
+            # Yield the permanent log AFTER processing the chunk (success or failure)
+            yield None, "\n".join(status_messages)
 
-                    if not (os.path.exists(output_filepath) and os.path.getsize(output_filepath) >= MIN_SAVED_AUDIO_FILE_SIZE_BYTES):
-                        raise IOError(f"Saved file '{output_filepath}' is missing or too small after primary save.")
-                    generated_audio_final_path = output_filepath
-                    status_messages.append(f"✅ Audio saved: {output_filepath}")
+        progress(0.90, desc="All chunks processed.")  # Loop finished
+        yield None, "\n".join(status_messages)
 
-                except Exception as e_save:
-                    status_messages.append(f"⚠️ Error saving audio to primary path '{output_filepath}': {e_save}. Trying backup path.")
-                    logger.warning(f"Primary save failed for '{output_filepath}'. Trying backup.", exc_info=True)
-                    try:
-                        sample_rate = getattr(tts_model, 'sr', 24000)  # Ensure SR is defined for backup
-                        ta.save(backup_output_filepath, merged_wav.cpu(), sample_rate)
-                        if not (os.path.exists(backup_output_filepath) and os.path.getsize(backup_output_filepath) >= MIN_SAVED_AUDIO_FILE_SIZE_BYTES):
-                            raise IOError(f"Backup saved file '{backup_output_filepath}' is missing or too small.")
-                        generated_audio_final_path = backup_output_filepath
-                        status_messages.append(f"✅ Audio saved to backup: {backup_output_filepath}")
-                    except Exception as e_backup_save:
-                        status_messages.append(f"❌ Error saving audio to backup path '{backup_output_filepath}': {e_backup_save}")
-                        logger.error(f"Backup save failed for '{backup_output_filepath}'", exc_info=True)
-                        yield None, "\n".join(status_messages);
-                        return
-
-                progress(0.98)  # Saving almost complete
-                # Final success message and settings save
-                duration_secs = merged_wav.shape[1] / sample_rate
-                final_msg = f"🎉 Success! Audio duration: {duration_secs:.2f}s. Output: {os.path.basename(generated_audio_final_path)}"
-                if failed_chunks_count > 0:
-                    final_msg += f" (with {failed_chunks_count} silent chunks)"
-                status_messages.append(final_msg)
-                print(f"CONSOLE: {final_msg}")
-
-                output_file_size_mb = os.path.getsize(generated_audio_final_path) / (1024 * 1024)
-                if output_file_size_mb > MAX_OUTPUT_FILE_SIZE_MB:
-                    size_warn_msg = f"⚠️ Output file size ({output_file_size_mb:.1f}MB) exceeds threshold of {MAX_OUTPUT_FILE_SIZE_MB}MB."
-                    status_messages.append(size_warn_msg)
-                    logger.warning(size_warn_msg)
-
-                save_settings(device_choice, cfg_weight_input, exaggeration_input, temperature_input,
-                              long_text_input, target_chars_input, max_chars_input,
-                              int(seed_num), prompt_successfully_persisted_this_run)
-
-                status_messages.append("✅ Done!")
-                progress(1.0)  # All done!
-                yield generated_audio_final_path, "\n".join(status_messages)
-                return
-            else:  # merged_wav.numel() == 0
-                status_messages.append("❌ Error: Merged audio is empty, nothing to save.")
-                yield None, "\n".join(status_messages);
-                return
-
-        except Exception as e_gen_loop:  # Catch errors specifically from the chunking/generation/merging/saving block
-            error_msg = f"❌ Unexpected error during TTS generation stages: {e_gen_loop}"
-            print(f"CONSOLE: {error_msg}\n{traceback.format_exc()}")  # Keep for server logs
-            logger.error("Generation loop/stages error", exc_info=True)
-            status_messages.append(error_msg)
+        if not all_wavs_gen or all(w.numel() == 0 for w in all_wavs_gen):
+            status_messages.append("❌ Error: No audio data generated after processing all chunks.")
             yield None, "\n".join(status_messages);
             return
 
-    except gr.Error as ge:  # Catch Gradio specific errors if any are raised directly from other parts
-        error_msg = f"❌ Application Error: {str(ge)}"
-        print(f"CONSOLE: {error_msg}\n{traceback.format_exc()}")
-        logger.error(f"Gradio App Error: {str(ge)}", exc_info=True)  # exc_info=True for context
-        status_messages.append(error_msg)
-        yield None, "\n".join(status_messages);
-        return
-    except Exception as e_outer:  # Catch-all for any other unexpected errors
+        if failed_chunks_count_gen > 0:
+            status_messages.append(f"⚠️ Gen completed with {failed_chunks_count_gen}/{total_chunks_gen} failed chunks.")"""
+
+        # End of main generation loop section that was refactored back in
+
+        # Stage 6: Merging and Saving
+        progress(0.90, desc="Merging audio...")
+        status_messages.append("🔊 Merging audio chunks...")
+        yield None, "\n".join(status_messages)
+        # ... (Your existing merge and save logic - ensure it updates status_messages and handles errors) ...
+        # For brevity, assuming merge_and_save would be a helper or this logic is here:
+        try:
+            merge_device = getattr(tts_model, 'device', 'cpu')
+            processed_wavs = [wav.to(merge_device) for wav in all_wavs]
+            merged_wav = torch.cat(processed_wavs, dim=1)
+        except RuntimeError as e_merge:  # OOM etc.
+            status_messages.append(f"❌ Error merging audio: {str(e_merge)}. Try CPU merge.")
+            yield None, "\n".join(status_messages)
+            try:  # CPU Merge Fallback
+                cpu_wavs = [wav.cpu() for wav in all_wavs]
+                merged_wav = torch.cat(cpu_wavs, dim=1)
+                status_messages.append("✅ Merged on CPU after initial failure.")
+            except Exception as e_cpu_merge:
+                status_messages.append(f"❌ CPU merge also failed: {e_cpu_merge}")
+                yield None, "\n".join(status_messages);
+                return
+        progress(0.95, desc="Merging complete.")
+        yield None, "\n".join(status_messages)
+
+        if merged_wav.numel() == 0:
+            status_messages.append("❌ Error: Merged audio is empty.")
+            yield None, "\n".join(status_messages);
+            return
+
+        status_messages.append("🔄 Saving audio...")
+        yield None, "\n".join(status_messages)
+        output_dir = os.path.join(APP_DATA_DIR, "outputs");
+        os.makedirs(output_dir, exist_ok=True)
+        timestamp = int(time.time());
+        output_filename = f"chatterbox_output_{timestamp}.wav"
+        output_filepath = os.path.join(output_dir, output_filename)
+        try:
+            sample_rate = getattr(tts_model, 'sr', 24000)
+            ta.save(output_filepath, merged_wav.cpu(), sample_rate)
+            if not (os.path.exists(output_filepath) and os.path.getsize(output_filepath) >= MIN_SAVED_AUDIO_FILE_SIZE_BYTES):
+                raise IOError("Saved file missing or too small.")
+            generated_audio_final_path = output_filepath
+            status_messages.append(f"✅ Audio saved: {output_filepath}")
+        except Exception as e_save:  # Handle primary save error, try backup
+            status_messages.append(f"⚠️ Error saving to primary: {e_save}. Trying backup.")
+            logger.warning(f"Primary save failed. Trying backup.", exc_info=True)
+            backup_output_filepath = os.path.join(os.getcwd(), f"chatterbox_output_backup_{timestamp}.wav")
+            try:
+                ta.save(backup_output_filepath, merged_wav.cpu(), sample_rate)
+                if not (os.path.exists(backup_output_filepath) and os.path.getsize(backup_output_filepath) >= MIN_SAVED_AUDIO_FILE_SIZE_BYTES):
+                    raise IOError("Backup saved file missing or too small.")
+                generated_audio_final_path = backup_output_filepath
+                status_messages.append(f"✅ Audio saved to backup: {backup_output_filepath}")
+            except Exception as e_backup_save:
+                status_messages.append(f"❌ Error saving to backup: {e_backup_save}")
+                yield None, "\n".join(status_messages);
+                return
+
+        progress(0.98, desc="Saving complete.")
+        duration_secs = merged_wav.shape[1] / sample_rate
+        final_msg = f"🎉 Success! Audio duration: {duration_secs:.2f}s. Output: {os.path.basename(generated_audio_final_path)}"
+        if failed_chunks_count > 0: final_msg += f" (with {failed_chunks_count} silent chunks)"
+        status_messages.append(final_msg)
+        print(f"CONSOLE: {final_msg}")
+
+        save_settings(device_choice, cfg_weight_input, exaggeration_input, temperature_input,
+                      long_text_input, target_chars_input, max_chars_input,
+                      int(seed_num), prompt_successfully_persisted_this_run)
+
+        status_messages.append("✅ Done!")
+        progress(1.0, desc="Completed!")
+        # Final yield that becomes the return value for the generator
+        yield generated_audio_final_path, "\n".join(status_messages)
+        return  # Explicit return to signal end of generator
+
+    except Exception as e_outer:
         error_msg = f"❌ Critical error in TTS process: {e_outer}"
-        print(f"CONSOLE: {error_msg}\n{traceback.format_exc()}")
+        print(f"CONSOLE: {error_msg}\n{traceback.format_exc()}");
         logger.error("Critical TTS error", exc_info=True)
         status_messages.append(error_msg)
         yield None, "\n".join(status_messages);
-        return
+        return  # Yield final error status
     finally:
-        # Cleanup CUDA cache if model was on CUDA
         if tts_model and current_device_loaded == "cuda" and torch.cuda.is_available():
             try:
-                torch.cuda.empty_cache()
-                logger.info("CUDA cache cleared post-generation.")
+                torch.cuda.empty_cache(); logger.info("CUDA cache cleared.")
             except Exception as e_cache:
                 logger.warning(f"Could not clear CUDA cache: {e_cache}")
         logger.info("TTS generation process finished.")
 
 
-# --- Gradio Interface Definition ---
-css = """ footer {display: none !important;} .gradio-container {max-width: 950px !important; margin: auto !important;} .gr-input-label {font-weight: bold;} """
 
-# Load initial settings once at startup
+# --- Function to Clear Persistent Prompt ---
+def clear_persistent_prompt_action(
+    current_audio_prompt_path: Optional[str], # ADDED: To receive current value of audio_prompt_input
+    current_status_text_val: str # Existing input
+):
+    messages = []
+    logger.info(f"Clear persistent prompt action called. Current UI prompt path: {current_audio_prompt_path}")
+    # The current_audio_prompt_path isn't strictly needed for the clearing logic itself,
+    # but having it in 'inputs' seems to help gr.File initialize correctly.
+
+    cleared_physically = False
+    settings_updated = False
+    try:
+        if os.path.exists(PERSISTENT_PROMPT_PATH):
+            os.remove(PERSISTENT_PROMPT_PATH)
+            messages.append(f"✅ Successfully removed persistent prompt file: {PERSISTENT_PROMPT_FILENAME}")
+            logger.info(f"User cleared persistent prompt file: {PERSISTENT_PROMPT_PATH}")
+            cleared_physically = True
+        else:
+            messages.append(f"ℹ️ No persistent prompt file found at {PERSISTENT_PROMPT_PATH} to remove.")
+            # Consider this a success in terms of the desired state (no persistent file)
+            cleared_physically = True
+
+        # Update settings to reflect no persistent prompt
+        current_saved_settings = load_settings()
+        if current_saved_settings.get("has_persistent_prompt", False) or current_saved_settings.get("audio_prompt_path") is not None:
+            save_settings( # This will now save with has_persistent_prompt = False
+                device=current_saved_settings["device"], cfg=current_saved_settings["cfg_weight"],
+                exg=current_saved_settings["exaggeration"], temp=current_saved_settings["temperature"],
+                long_text=current_saved_settings["long_text"], target_chars=current_saved_settings["target_chars_per_chunk"],
+                max_chars=current_saved_settings["max_chars_per_chunk"], seed_value=current_saved_settings["seed"],
+                prompt_successfully_persisted_this_run=False # THIS IS THE KEY CHANGE for settings
+            )
+            messages.append("✅ Settings updated to reflect no active persistent prompt.")
+            settings_updated = True
+        else:
+            messages.append("ℹ️ Settings already indicate no active persistent prompt.")
+            settings_updated = True # State is already as desired
+
+        if cleared_physically and settings_updated:
+            # Return update for the audio prompt input (to clear it) and the status text
+            return gr.update(value=None), "\n".join(messages)
+        else:
+            # Should ideally always be true if logic is correct, but as a fallback
+            return gr.update(value=None), "\n".join(messages) # Still attempt to clear UI field
+
+    except Exception as e:
+        logger.error(f"Error clearing persistent prompt: {e}", exc_info=True)
+        messages.append(f"❌ Error clearing persistent prompt: {e}")
+        # Return current (or no change) for audio_prompt_input, and error for status
+        return gr.update(), "\n".join(messages) # gr.update() with no args means no change
+
+# --- Gradio Interface Definition ---
+css = """
+footer {display: none !important;}
+
+/* --- KEY FIXES FOR FULL-WIDTH LAYOUT --- */
+:root {
+    /* Allows the inner content container to grow */
+    --layout-container-width-max: 100% !important;
+    /* Removes the max-width limit from the main Blocks container */
+    --max-width: none !important;
+}
+
+.gr-input-label {font-weight: bold;}
+
+/* --- CSS for .file-input-container-fixed-height (for audio_prompt_input VERTICAL stability) --- */
+/* THIS SECTION REMAINS THE SAME - IT'S FOR HEIGHT */
+.file-input-container-fixed-height {
+    min-height: 100px;
+    height: 100px;
+    width: 100%;       /* Takes full width of its parent PROPORTIONAL column */
+    display: flex;
+    flex-direction: column;
+    border: 1px solid #E0E0E0;
+    padding: 8px;
+    box-sizing: border-box;
+    overflow: hidden;
+}
+.file-input-container-fixed-height > .styler {
+    display: flex; flex-direction: column; flex-grow: 1; width: 100%; min-height: 0; overflow:hidden;
+}
+.file-input-container-fixed-height > .styler > .block {
+    flex-grow: 1; display: flex; flex-direction: column; width: 100%; min-height: 0; overflow: hidden;
+}
+.file-input-container-fixed-height > .styler > .block > label {
+    flex-shrink: 0; margin-bottom: 8px; text-align: left; width: 100%; box-sizing: border-box;
+}
+.file-input-container-fixed-height .file-preview-holder {
+    flex-grow: 1; display: flex; flex-direction: column; justify-content: center;
+    align-items: flex-start; width: 100%; min-height: 0; overflow-y: auto;
+}
+.file-input-container-fixed-height .file-preview-holder td.filename {
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block;
+}
+.file-input-container-fixed-height > .styler > .block > button {
+    flex-grow: 1; height: auto; min-height: 100px; width: 100%;
+    display: flex; align-items: center; justify-content: center;
+    border: 2px dashed #A0A0A0; box-sizing: border-box; padding: 10px; text-align: center;
+}
+
+
+/* --- Styling for Output Row to have equal height columns (Optional but good) --- */
+/* If you added elem_id="main_output_row" to the gr.Row for outputs: */
+#main_output_row { /* Keep this if you want stretched equal height for output columns */
+    display: flex;
+    align-items: stretch;
+}
+#main_output_row > div[class*="gradio-column"] > div.block,
+#main_output_row > div[class*="gradio-column"] > div.form {
+    flex-grow: 1; display: flex; flex-direction: column; height: 100%;
+}
+#main_output_row div.gradio-audio {
+    flex-grow: 1; display: flex; flex-direction: column; min-height: 150px;
+}
+#main_output_row div.gradio-audio .empty {
+    flex-grow: 1; display: flex; align-items: center; justify-content: center;
+}
+
+/* --- General rule to help components conform to column widths --- */
+/* This tells direct .block or .form children of any Gradio column to take 100% width */
+div[class*="gradio-column"] > .block,
+div[class*="gradio-column"] > .form {
+    width: 100% !important;
+    box-sizing: border-box; /* Include padding/border in the 100% width */
+}
+/* And textareas within those forms */
+div[class*="gradio-column"] > .form textarea {
+    width: 100% !important;
+    box-sizing: border-box;
+}
+"""
+
 try:
     initial_settings = load_settings()
-except Exception as e: # Broad catch for initial settings load failure
+except Exception as e:
     logger.critical(f"FATAL: Could not load initial settings: {e}. Using hardcoded defaults.", exc_info=True)
-    initial_settings = { # Hardcoded fallback defaults
+    initial_settings = {
         "device": "cpu", "cfg_weight": 0.2, "exaggeration": 0.8, "temperature": 0.8,
-        "long_text": "Welcome! Settings failed to load. Please check configuration.",
+        "long_text": "Welcome! Settings failed to load.",
         "target_chars_per_chunk": 100, "max_chars_per_chunk": 200, "seed": 0,
         "audio_prompt_path": None
     }
 
-
-with gr.Blocks(css=css, theme=gr.themes.Soft(primary_hue=gr.themes.colors.blue, secondary_hue=gr.themes.colors.sky)) as demo:
+with gr.Blocks(css=css, theme=gr.themes.Soft(primary_hue=gr.themes.colors.blue, secondary_hue=gr.themes.colors.sky),fill_width=True) as demo:
     gr.Markdown("<h1 align='center'>ChatterboxTTS Long Text Synthesizer</h1>"
                 "Synthesize long text. Upload text, a WAV voice prompt, adjust parameters, and generate!")
 
-    with gr.Row():
-        with gr.Column(scale=3):
+    # This is the main row whose columns you want to fix
+    with gr.Row(elem_id="main_content_row"):
+        with gr.Column(scale=3): # Input Column Left
             text_input = gr.Textbox(
                 label="📜 Long Text Input",
                 placeholder="Paste long text here...",
-                lines=12,
+                lines=22,
                 value=initial_settings["long_text"]
             )
+            with gr.Group(elem_classes="file-input-container-fixed-height"):
+                _initial_audio_prompt_ui = initial_settings.get("audio_prompt_path")
+                if _initial_audio_prompt_ui and not os.path.exists(_initial_audio_prompt_ui):
+                    _initial_audio_prompt_ui = None
+                audio_prompt_input = gr.File(
+                    label="🎤 Voice Prompt WAV File (Max 100MB, 0.5-30s)", #...
+                    value=_initial_audio_prompt_ui
+                )
+            clear_prompt_button = gr.Button("🧹 Clear Saved Voice Prompt", variant="stop", size="sm")
 
-            # Ensure audio_prompt_input correctly reflects the loaded setting if it exists for the UI
-            _initial_audio_prompt_ui = initial_settings.get("audio_prompt_path")
-            if _initial_audio_prompt_ui and not os.path.exists(_initial_audio_prompt_ui):
-                logger.warning(f"Initial audio prompt path '{_initial_audio_prompt_ui}' from settings not found. Clearing from UI.")
-                _initial_audio_prompt_ui = None
-
-            audio_prompt_input = gr.File(
-                label="🎤 Voice Prompt WAV File (Max 100MB, 0.5-30s)",
-                file_types=['.wav'],
-                type="filepath",
-                value=_initial_audio_prompt_ui
-            )
-        with gr.Column(scale=2):
+        with gr.Column(scale=2): # Input Column Right
             gr.Markdown("### ⚙️ Generation Parameters")
             device_input = gr.Dropdown(
-                label="🧠 Processing Device",
-                choices=["cuda", "cpu"],
-                value=initial_settings["device"],
-                info="Select 'cuda' for GPU or 'cpu'."
+                label="🧠 Processing Device", choices=["cuda", "cpu"],
+                value=initial_settings["device"], info="Select 'cuda' for GPU or 'cpu'."
             )
-            cfg_weight_slider = gr.Slider(minimum=0.0, maximum=2.0, value=initial_settings["cfg_weight"], step=0.05, label="🔊 CFG Weight")
-            exaggeration_slider = gr.Slider(minimum=0.0, maximum=2.0, value=initial_settings["exaggeration"], step=0.05, label="🎭 Exaggeration")
-            temperature_slider = gr.Slider(minimum=0.1, maximum=1.5, value=initial_settings["temperature"], step=0.05, label="🔥 Temperature")
-            seed_slider = gr.Slider(
-                minimum=0, maximum=2**32 - 1, # Consistent with set_seed
-                value=initial_settings["seed"],
-                step=1,
-                label="🌱 Seed",
-                info="Set a specific seed for reproducibility. 0 means random."
+            cfg_weight_slider = gr.Slider(#...
+                value=initial_settings["cfg_weight"])
+            exaggeration_slider = gr.Slider(#...
+                value=initial_settings["exaggeration"])
+            temperature_slider = gr.Slider(#...
+                value=initial_settings["temperature"])
+            seed_slider = gr.Slider(#...
+                value=initial_settings["seed"]
             )
             gr.Markdown("### ✂️ Chunking Parameters")
-            target_chars_slider = gr.Slider(
-                minimum=MIN_CHUNK_SIZE, maximum=500, value=initial_settings["target_chars_per_chunk"], step=10,
-                label="🎯 Target Chars/Chunk", info=f"Approx. target characters per audio chunk (min {MIN_CHUNK_SIZE})."
-            )
-            max_chars_slider = gr.Slider(
-                minimum=MIN_CHUNK_SIZE + 10 , maximum=1000, value=initial_settings["max_chars_per_chunk"], step=10, # Ensure max > min
-                label="🛑 Max Chars/Chunk", info="Hard character limit per chunk (must be > Target)."
-            )
+            target_chars_slider = gr.Slider(#...
+                value=initial_settings["target_chars_per_chunk"])
+            max_chars_slider = gr.Slider(#...
+                value=initial_settings["max_chars_per_chunk"])
 
     with gr.Row():
         submit_button = gr.Button("🚀 Generate Speech", variant="primary", scale=1)
 
-    with gr.Row():
+    with gr.Row(elem_id="main_content_row"):
         with gr.Column(scale=3):
+            # Define audio_output directly where it should appear in the layout
             audio_output = gr.Audio(label="🎧 Generated Speech Output", type="filepath")
         with gr.Column(scale=2):
+            # Define status_output directly where it should appear in the layout
             status_output = gr.Textbox(
                 label="📊 Log / Status Updates",
                 lines=15,
@@ -1237,20 +1581,28 @@ with gr.Blocks(css=css, theme=gr.themes.Soft(primary_hue=gr.themes.colors.blue, 
             device_input, seed_slider
         ],
         outputs=[audio_output, status_output],
-        show_progress_on=audio_output,
-        show_progress="full" # 'full' shows progress bar and percentage updates
+        show_progress_on=audio_output,  # Link spinner to audio_output
+        show_progress="full"  # 'full' shows progress bar and percentage updates
+    )
+
+    # Event listener for the clear button
+    clear_prompt_button.click(
+        fn=clear_persistent_prompt_action,
+        # Ensure audio_prompt_input is an input for interactivity
+        inputs=[audio_prompt_input, status_output],
+        outputs=[audio_prompt_input, status_output]  # Update audio input field and status
     )
 
     gr.Markdown("---")
-    gr.Markdown(f"💡 **Note:** Settings are saved in `{APP_DATA_DIR}`. Output audio is saved in `{os.path.join(APP_DATA_DIR, 'outputs')}` (or script directory as backup).")
+    gr.Markdown(f"💡 **Note:** Settings in `{APP_DATA_DIR}`. Outputs in `{os.path.join(APP_DATA_DIR, 'outputs')}`.")
 
 if __name__ == "__main__":
     try:
-        ensure_app_data_dir() # Ensure it's created at startup
+        ensure_app_data_dir()  # Ensure it's created at startup
         logger.info(f"Application data directory '{APP_DATA_DIR}' ensured.")
     except Exception as e:
         logger.critical(f"Could not initialize application data directory '{APP_DATA_DIR}': {e}. App may not function correctly.", exc_info=True)
         # The app might still run if settings load uses hardcoded defaults and output goes to script dir.
 
-    print(f"CONSOLE: Initial settings loaded for UI: Device={initial_settings['device']}, Target Chars={initial_settings['target_chars_per_chunk']}, Seed={initial_settings['seed']}, Prompt={initial_settings['audio_prompt_path']}")
+    print(f"CONSOLE: Initial settings: Device={initial_settings['device']}, Seed={initial_settings['seed']}, Prompt={initial_settings['audio_prompt_path']}")
     demo.queue().launch(debug=True, share=False)
