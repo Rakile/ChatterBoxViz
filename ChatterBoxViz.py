@@ -15,7 +15,7 @@ import sys
 import contextlib
 import logging
 from pathlib import Path
-
+from huggingface_hub import hf_hub_download
 from chatterbox.tts import ChatterboxTTS
 if not os.path.exists("outputs"):
     os.makedirs("outputs")
@@ -184,19 +184,37 @@ def validate_parameters(cfg_weight: float, exaggeration: float, temperature: flo
 
 
 def check_disk_space(required_mb: float = 100) -> tuple[bool, str]:
-    """Check available disk space"""
+    """Check available disk space (cross-platform)."""
     try:
-        # Check space in APP_DATA_DIR or current dir if APP_DATA_DIR doesn't exist yet
-        check_path = APP_DATA_DIR if os.path.exists(APP_DATA_DIR) else '.'
-        statvfs = os.statvfs(check_path)
-        available_mb = (statvfs.f_frsize * statvfs.f_bavail) / (1024 * 1024) # f_bavail for non-superuser
+        # Determine path to check: APP_DATA_DIR or current dir if it doesn't exist yet.
+        # For shutil.disk_usage, it's better to check a directory that is expected to exist.
+        # If APP_DATA_DIR might not exist yet, default to current directory for the check.
+        check_path = APP_DATA_DIR
+        if not os.path.exists(check_path) or not os.path.isdir(check_path):
+            check_path = '.' # Check current working directory if APP_DATA_DIR is not valid yet
+            logger.info(f"APP_DATA_DIR ('{APP_DATA_DIR}') not found or not a directory, checking disk space for current directory ('{os.path.abspath(check_path)}').")
+
+
+        # shutil.disk_usage returns a named tuple with total, used, and free bytes.
+        # 'free' is what's available to the user (might be less than total - used for non-superusers).
+        usage = shutil.disk_usage(check_path)
+        available_mb = usage.free / (1024 * 1024)
 
         if available_mb < required_mb:
-            return False, f"Insufficient disk space in '{check_path}'. Required: {required_mb:.1f}MB, Available: {available_mb:.1f}MB"
+            return False, f"Insufficient disk space in '{os.path.abspath(check_path)}'. Required: {required_mb:.1f}MB, Available: {available_mb:.1f}MB"
 
-        return True, f"Sufficient disk space: {available_mb:.1f}MB available in '{check_path}'"
+        return True, f"Sufficient disk space: {available_mb:.1f}MB available in '{os.path.abspath(check_path)}'"
+    except AttributeError:
+        # This might catch issues if shutil.disk_usage is somehow unavailable (very rare on Python 3.3+)
+        logger.warning("shutil.disk_usage not available (unexpected). Skipping disk space check.")
+        return True, "Disk space check skipped (shutil.disk_usage unavailable)"
+    except FileNotFoundError:
+        # If the check_path itself becomes invalid between os.path.exists and shutil.disk_usage (race condition, rare)
+        # or if '.' is somehow not a valid path (extremely rare).
+        logger.warning(f"Path '{check_path}' not found during disk space check. Skipping check.")
+        return True, "Disk space check skipped (path not found)"
     except Exception as e:
-        logger.warning(f"Could not check disk space: {e}")
+        logger.warning(f"Could not check disk space using shutil.disk_usage: {e}")
         return True, "Disk space check skipped (warning)"
 
 
@@ -245,55 +263,109 @@ def ensure_app_data_dir():
 
 def save_settings(device, cfg, exg, temp, long_text, target_chars, max_chars, seed_value,
                   prompt_successfully_persisted_this_run):
-    """Save settings with comprehensive error handling, including atomic write."""
+    """Save settings only if they have changed, with atomic write and conditional backup."""
     temp_settings_file_path = None
-    try:
-        ensure_app_data_dir() # Ensures APP_DATA_DIR exists and is writable
+    made_change = False  # Flag to track if a save actually happened
 
-        settings = {
+    try:
+        ensure_app_data_dir()
+
+        new_settings = {
             "device": device,
             "cfg_weight": float(cfg),
             "exaggeration": float(exg),
             "temperature": float(temp),
-            "long_text": str(long_text)[:10000],  # Limit stored text length further if needed
+            "long_text": str(long_text)[:50000],  # Limit stored text length
             "target_chars_per_chunk": int(target_chars),
             "max_chars_per_chunk": int(max_chars),
             "seed": int(seed_value),
             "has_persistent_prompt": prompt_successfully_persisted_this_run and os.path.exists(PERSISTENT_PROMPT_PATH),
-            "last_saved": time.time()
+            "last_saved_timestamp": time.time()  # Use a more descriptive key
         }
 
-        # Write to a temporary file in the same directory for atomic replace
-        fd, temp_settings_file_path = tempfile.mkstemp(suffix=".json", dir=APP_DATA_DIR)
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(settings, f, indent=4, ensure_ascii=False)
-
-        # Create backup of existing settings before replacing
+        existing_settings = None
         if os.path.exists(SETTINGS_FILE):
-            backup_file = f"{SETTINGS_FILE}.{int(time.time())}.backup" # Timestamped backup
             try:
-                shutil.copy2(SETTINGS_FILE, backup_file)
-                logger.info(f"Created settings backup: {backup_file}")
-            except Exception as e:
-                logger.warning(f"Could not create settings backup: {e}")
+                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f_old:
+                    existing_settings = json.load(f_old)
+                    # Normalize by re-dumping to compare consistently, or compare key by key
+                    # For simplicity, direct dictionary comparison often works if types are consistent.
+                    # However, float precision or order of keys can be an issue.
+                    # A robust comparison might involve checking each key or converting to a canonical JSON string.
 
-        # Atomically replace the old settings file
+                    # Let's remove the 'last_saved_timestamp' for comparison, as it will always change.
+                    existing_settings_for_comparison = existing_settings.copy()
+                    existing_settings_for_comparison.pop("last_saved_timestamp", None)
+                    new_settings_for_comparison = new_settings.copy()
+                    new_settings_for_comparison.pop("last_saved_timestamp", None)
+
+                    if existing_settings_for_comparison == new_settings_for_comparison:
+                        logger.info(f"Settings have not changed. Skipping save to {SETTINGS_FILE}.")
+                        return  # Exit if settings are identical (excluding timestamp)
+            except json.JSONDecodeError:
+                logger.warning(f"Could not decode existing settings file '{SETTINGS_FILE}' for comparison. Will overwrite.")
+                existing_settings = None  # Treat as if no valid existing settings
+            except Exception as e_read:
+                logger.warning(f"Error reading existing settings file '{SETTINGS_FILE}' for comparison: {e_read}. Will proceed to save/overwrite.")
+                existing_settings = None
+
+        logger.info(f"Settings have changed or no existing valid settings. Proceeding to save to {SETTINGS_FILE}.")
+        made_change = True
+
+        # Write to a temporary file in the same directory for atomic replace
+        # Use 'delete=False' with NamedTemporaryFile to manage renaming/deletion manually
+        # Or stick to mkstemp for more control as you had.
+        fd, temp_settings_file_path = tempfile.mkstemp(suffix=".json", prefix="settings_tmp_", dir=APP_DATA_DIR)
+        with os.fdopen(fd, 'w', encoding='utf-8') as f_temp:
+            json.dump(new_settings, f_temp, indent=4, ensure_ascii=False)
+        # fdopen closes the fd, so no need to os.close(fd)
+
+        # Create backup of existing settings *only if we are actually overwriting different settings*
+        if os.path.exists(SETTINGS_FILE):  # Check again before backup/move
+            backup_file = f"{SETTINGS_FILE}.{int(time.time())}.backup"
+            try:
+                shutil.copy2(SETTINGS_FILE, backup_file)  # copy2 preserves metadata
+                logger.info(f"Created settings backup: {backup_file}")
+            except Exception as e_backup:
+                logger.warning(f"Could not create settings backup for '{SETTINGS_FILE}': {e_backup}")
+
+        # Atomically replace the old settings file with the new one
         shutil.move(temp_settings_file_path, SETTINGS_FILE)
-        temp_settings_file_path = None # Mark as moved, so finally block doesn't try to delete
+        temp_settings_file_path = None  # Mark as moved, so finally block doesn't try to delete
         logger.info(f"Settings saved successfully to {SETTINGS_FILE}")
 
     except Exception as e:
         logger.error(f"Error saving settings: {e}\n{traceback.format_exc()}")
-        # Don't raise gr.Error here as this shouldn't stop the main process, but log thoroughly
     finally:
-        # Clean up temporary file if move failed or an exception occurred before move
         if temp_settings_file_path and os.path.exists(temp_settings_file_path):
             try:
                 os.remove(temp_settings_file_path)
-                logger.info(f"Removed temporary settings file: {temp_settings_file_path}")
+                logger.info(f"Cleaned up temporary settings file: {temp_settings_file_path}")
             except Exception as e_clean:
                 logger.warning(f"Could not remove temporary settings file {temp_settings_file_path}: {e_clean}")
 
+        # Optional: Prune old backups if too many exist
+        cleanup_old_backups(APP_DATA_DIR, SETTINGS_FILE, keep_latest_n=10)
+
+
+# Optional: Function to clean up old backups
+def cleanup_old_backups(directory: str, base_filename: str, keep_latest_n: int):
+    try:
+        base_name = os.path.basename(base_filename)
+        backups = sorted(
+            [f for f in os.listdir(directory) if f.startswith(base_name) and f.endswith(".backup")],
+            key=lambda f_name: os.path.getmtime(os.path.join(directory, f_name))
+        )
+
+        if len(backups) > keep_latest_n:
+            for old_backup in backups[:-keep_latest_n]:  # Keep the N newest ones
+                try:
+                    os.remove(os.path.join(directory, old_backup))
+                    logger.info(f"Removed old settings backup: {old_backup}")
+                except Exception as e_remove:
+                    logger.warning(f"Could not remove old backup {old_backup}: {e_remove}")
+    except Exception as e:
+        logger.warning(f"Error during backup cleanup: {e}")
 
 def load_settings():
     """Load settings with comprehensive error handling and validation"""
@@ -591,6 +663,7 @@ def ensure_model_loaded(device_choice: str):
             tts_model_candidate = ChatterboxTTS.from_pretrained(device=device_choice)
             #tts_model_candidate.conds.= tts_model_candidate.Conditionals(t3_cond, s3gen_ref_dict)
 
+
         tts_model = tts_model_candidate # Assign only after successful load
         current_device_loaded = device_choice
         # Call progress_fn without desc
@@ -738,7 +811,9 @@ def process_text_to_speech(
             status_messages.append(f"✅ {model_load_status}")
             if audio_prompt_file_path is None:
                 status_messages.append("✅ Setting up inbuilt voice...")
-                #tts_model.use_inbuilt_voice(device_choice)
+                REPO_ID = "ResembleAI/chatterbox"
+                local_path = hf_hub_download(repo_id=REPO_ID, filename="conds.pt")
+                tts_model.conds = tts_model.conds.load(local_path, "cuda")
         except gr.Error as e_gr:  # Catch gr.Error specifically from ensure_model_loaded
             status_messages.append(f"❌ Model loading failed: {str(e_gr)}")
             logger.error(f"Model loading gr.Error: {str(e_gr)}", exc_info=False)  # No need for full trace if gr.Error
@@ -758,60 +833,55 @@ def process_text_to_speech(
         current_prompt_path_for_generation = None
         prompt_successfully_persisted_this_run = False
 
-        if audio_prompt_file_path:
-            abs_audio_path = os.path.abspath(audio_prompt_file_path)
-            abs_persistent_path = os.path.abspath(PERSISTENT_PROMPT_PATH)
-            if abs_audio_path == abs_persistent_path:  # Using existing persistent
-                if os.path.exists(PERSISTENT_PROMPT_PATH):
-                    audio_valid, audio_msg = validate_audio_file(PERSISTENT_PROMPT_PATH)
-                    if audio_valid:
-                        current_prompt_path_for_generation = PERSISTENT_PROMPT_PATH
-                        prompt_successfully_persisted_this_run = True
-                        status_messages.append(f"✅ Using selected persistent prompt: {PERSISTENT_PROMPT_FILENAME} ({audio_msg})")
-                    else:
-                        status_messages.append(f"❌ Selected persistent prompt '{PERSISTENT_PROMPT_FILENAME}' is invalid: {audio_msg}.")
-                        try:
-                            os.remove(PERSISTENT_PROMPT_PATH)
-                        except Exception as e_rem:
-                            logger.error(f"Failed to remove invalid persistent prompt: {e_rem}")
-                        yield None, "\n".join(status_messages);
-                        return
-                else:  # Path matched but file doesn't exist (edge case)
-                    status_messages.append(f"❌ Persistent prompt '{PERSISTENT_PROMPT_FILENAME}' (selected by path) not found.")
-                    yield None, "\n".join(status_messages);
-                    return
-            else:  # New file uploaded
-                uploaded_temp_path = audio_prompt_file_path
-                audio_valid, audio_msg = validate_audio_file(uploaded_temp_path)
-                if not audio_valid:
-                    status_messages.append(f"❌ Invalid new audio prompt upload: {audio_msg}")
-                    yield None, "\n".join(status_messages);
-                    return
-                status_messages.append(f"✅ Valid new audio upload: {audio_msg}")
-                try:
-                    ensure_app_data_dir()  # Ensure dir exists before copy
-                    shutil.copy(uploaded_temp_path, PERSISTENT_PROMPT_PATH)
-                    current_prompt_path_for_generation = PERSISTENT_PROMPT_PATH
-                    prompt_successfully_persisted_this_run = True
-                    status_messages.append(f"💾 New prompt saved as persistent: {PERSISTENT_PROMPT_FILENAME}")
-                except Exception as e_copy:
-                    logger.warning(f"Could not save new upload as persistent prompt: {e_copy}. Using temporary for this session.", exc_info=True)
-                    status_messages.append(f"⚠️ Could not save prompt persistently ({e_copy}). Using temporary for this session.")
-                    current_prompt_path_for_generation = uploaded_temp_path  # Use the temp path from Gradio
-        elif os.path.exists(PERSISTENT_PROMPT_PATH) and 1==2:  # No file provided by user, but a persistent one exists
-            audio_valid, audio_msg = validate_audio_file(PERSISTENT_PROMPT_PATH)
-            if audio_valid:
-                current_prompt_path_for_generation = PERSISTENT_PROMPT_PATH
-                prompt_successfully_persisted_this_run = True  # It's already persistent
-                status_messages.append(f"✅ Using existing persistent prompt: {PERSISTENT_PROMPT_FILENAME} ({audio_msg})")
-            else:
-                status_messages.append(f"❌ Existing persistent prompt '{PERSISTENT_PROMPT_FILENAME}' is invalid: {audio_msg}. Please upload a new one.")
-                try:
-                    os.remove(PERSISTENT_PROMPT_PATH)
-                except Exception as e_rem:
-                    logger.error(f"Failed to remove invalid persistent prompt: {e_rem}")
+        ui_provided_prompt_path = audio_prompt_file_path
+
+        if ui_provided_prompt_path:
+            # ALWAYS validate the path Gradio gives you for the current run.
+            status_messages.append(f"🔄 Validating UI-provided audio prompt: '{os.path.basename(ui_provided_prompt_path)}'...")
+            yield None, "\n".join(status_messages)
+            audio_valid, audio_msg = validate_audio_file(ui_provided_prompt_path)
+
+            if not audio_valid:
+                status_messages.append(f"❌ Invalid audio prompt from UI: {audio_msg}")
                 yield None, "\n".join(status_messages);
                 return
+            status_messages.append(f"✅ UI-provided prompt is valid: {audio_msg}")
+
+            # Now, decide if we need to update PERSISTENT_PROMPT_PATH
+            # This happens if:
+            # 1. PERSISTENT_PROMPT_PATH doesn't exist yet.
+            # 2. Or, if PERSISTENT_PROMPT_PATH exists but the ui_provided_prompt_path is different
+            #    (This covers new uploads, AND Gradio re-serving a temp path for an already copied file.
+            #     To avoid redundant copies here, you'd need file content hashing).
+            #    For now, we will copy/overwrite to ensure PERSISTENT_PROMPT_PATH matches the UI's active file.
+
+            # Is the UI path already the persistent path? (Means it was loaded from settings and not changed)
+            is_ui_path_already_persistent = os.path.exists(PERSISTENT_PROMPT_PATH) and \
+                                            os.path.abspath(ui_provided_prompt_path) == os.path.abspath(PERSISTENT_PROMPT_PATH)
+
+            if is_ui_path_already_persistent:
+                status_messages.append(f"ℹ️ Using existing persistent prompt (UI path matches persistent path): {PERSISTENT_PROMPT_FILENAME}")
+                current_prompt_path_for_generation = PERSISTENT_PROMPT_PATH
+                prompt_successfully_persisted_this_run = True  # It's already our definitive persistent prompt
+            else:
+                # UI path is different, or persistent path doesn't exist.
+                # Treat ui_provided_prompt_path as the source of truth for this run and for persistence.
+                status_messages.append(f"💾 UI prompt is different or no persistent prompt exists. Updating/creating persistent prompt from '{os.path.basename(ui_provided_prompt_path)}'...")
+                yield None, "\n".join(status_messages)
+                try:
+                    ensure_app_data_dir()
+                    # This shutil.copy will handle the case where ui_provided_prompt_path is a temp file from Gradio.
+                    # It copies the *content* to your PERSISTENT_PROMPT_PATH.
+                    shutil.copy(ui_provided_prompt_path, PERSISTENT_PROMPT_PATH)
+                    current_prompt_path_for_generation = PERSISTENT_PROMPT_PATH  # Generation uses the canonical persistent path
+                    prompt_successfully_persisted_this_run = True
+                    status_messages.append(f"✅ Prompt saved/updated as persistent: {PERSISTENT_PROMPT_FILENAME}")
+                except Exception as e_copy:
+                    logger.warning(f"Could not copy UI prompt to persistent storage: {e_copy}. Using UI-provided path '{ui_provided_prompt_path}' for this session.", exc_info=True)
+                    status_messages.append(f"⚠️ Could not save prompt persistently (Error: {str(e_copy)[:50]}...). Using UI-provided path for this session.")
+                    current_prompt_path_for_generation = ui_provided_prompt_path  # Fallback to the path Gradio gave us
+                    prompt_successfully_persisted_this_run = False
+
         else:  # No file provided by user, and no persistent prompt exists
             status_messages.append("❌ No audio prompt provided and no persistent prompt found. Please upload a WAV prompt.")
             yield None, "\n".join(status_messages);
