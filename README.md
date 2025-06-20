@@ -40,9 +40,6 @@ You can adjust parameters such as CFG weight, temperature, exaggeration, chunk s
 ---
 
 ## Prerequisites
-The current version of chatterbox-tts (0.1.1) has a bug that prevents you from using the CPU.
-
-If you want to use CPU, you can replace tts.py with the one from https://github.com/resemble-ai/chatterbox/blob/main/src/chatterbox/tts.py
 
 1. **Operating System**  
    - Linux or Windows (PowerShell or Command Prompt recommended on Windows).  
